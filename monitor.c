@@ -16,8 +16,8 @@
 #include "monitor_ioctl.h"
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Container Runtime");
-MODULE_DESCRIPTION("Kernel memory monitor for containers");
+MODULE_AUTHOR("CHIRANTH.R (PES1UG24AM354) | Deeptanshu Kumar (PES1UG24AM357)");
+MODULE_DESCRIPTION("Kernel memory monitor for containers — Multi-Container Runtime");
 
 #define DEVICE_NAME      "container_monitor"
 #define MAX_MONITORED    64
@@ -39,6 +39,7 @@ static struct device       *monitor_device;
 static monitored_t          monitored_processes[MAX_MONITORED];
 static int                  monitored_count = 0;
 static DEFINE_SPINLOCK(monitored_lock);
+static monitored_t          monitor_snapshot[MAX_MONITORED];
 
 static struct task_struct  *monitor_thread;
 static volatile int         monitor_shutdown = 0;
@@ -84,23 +85,22 @@ static int monitor_thread_func(void *data) {
          * memory lookups outside the lock to avoid sleeping while
          * holding a spinlock.
          */
-        monitored_t snapshot[MAX_MONITORED];
         int count;
 
         spin_lock_irqsave(&monitored_lock, flags);
         count = monitored_count;
-        memcpy(snapshot, monitored_processes, count * sizeof(monitored_t));
+        memcpy(monitor_snapshot, monitored_processes, count * sizeof(monitored_t));
         spin_unlock_irqrestore(&monitored_lock, flags);
 
         for (i = 0; i < count; i++) {
-            if (!snapshot[i].active) continue;
+            if (!monitor_snapshot[i].active) continue;
 
-            struct task_struct *task = get_task_by_pid(snapshot[i].pid);
+            struct task_struct *task = get_task_by_pid(monitor_snapshot[i].pid);
             if (!task) {
                 /* Process gone – mark inactive */
                 spin_lock_irqsave(&monitored_lock, flags);
                 for (int j = 0; j < monitored_count; j++) {
-                    if (monitored_processes[j].pid == snapshot[i].pid) {
+                    if (monitored_processes[j].pid == monitor_snapshot[i].pid) {
                         monitored_processes[j].active = 0;
                         break;
                     }
@@ -111,15 +111,15 @@ static int monitor_thread_func(void *data) {
 
             unsigned long rss = get_process_rss(task);
 
-            if (rss > snapshot[i].hard_limit) {
+            if (rss > monitor_snapshot[i].hard_limit) {
                 printk(KERN_WARNING
                        "container_monitor: PID %d exceeded hard limit "
                        "(%lu > %lu), killing\n",
-                       snapshot[i].pid, rss, snapshot[i].hard_limit);
+                       monitor_snapshot[i].pid, rss, monitor_snapshot[i].hard_limit);
                 send_sig(SIGKILL, task, 0);
                 spin_lock_irqsave(&monitored_lock, flags);
                 for (int j = 0; j < monitored_count; j++) {
-                    if (monitored_processes[j].pid == snapshot[i].pid) {
+                    if (monitored_processes[j].pid == monitor_snapshot[i].pid) {
                         monitored_processes[j].active = 0;
                         break;
                     }
@@ -128,14 +128,14 @@ static int monitor_thread_func(void *data) {
                 continue;
             }
 
-            if (rss > snapshot[i].soft_limit && !snapshot[i].warned_soft) {
+            if (rss > monitor_snapshot[i].soft_limit && !monitor_snapshot[i].warned_soft) {
                 printk(KERN_WARNING
                        "container_monitor: PID %d exceeded soft limit "
                        "(%lu > %lu)\n",
-                       snapshot[i].pid, rss, snapshot[i].soft_limit);
+                       monitor_snapshot[i].pid, rss, monitor_snapshot[i].soft_limit);
                 spin_lock_irqsave(&monitored_lock, flags);
                 for (int j = 0; j < monitored_count; j++) {
-                    if (monitored_processes[j].pid == snapshot[i].pid) {
+                    if (monitored_processes[j].pid == monitor_snapshot[i].pid) {
                         monitored_processes[j].warned_soft = 1;
                         break;
                     }

@@ -1,6 +1,14 @@
+/* CHIRANTH.R | PES1UG24AM354
+ * Multi-container runtime: supervisor + CLI client.
+ *
+ * Container metadata is stored in an open-addressing hash table keyed on
+ * container ID (djb2 hash + linear probing), giving O(1) average lookup
+ * instead of a plain O(n) scan. All other data-structures (bounded-buffer
+ * log pipeline, UNIX-socket IPC) are described in README.md. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -21,11 +29,14 @@
 
 #include "monitor_ioctl.h"
 
-#define MAX_CONTAINERS 64
-#define MAX_CMD_LEN    1024
-#define MAX_ID_LEN     32
-#define MAX_PATH_LEN   256
-#define SOCKET_PATH    "/tmp/engine_supervisor.sock"
+#define AUTHOR_NAME     "CHIRANTH.R (PES1UG24AM354) | Deeptanshu Kumar (PES1UG24AM357)"
+#define AUTHOR_SRN      "PES1UG24AM354 | PES1UG24AM357"
+
+#define MAX_CONTAINERS  64
+#define MAX_CMD_LEN     1024
+#define MAX_ID_LEN      32
+#define MAX_PATH_LEN    256
+#define SOCKET_PATH     "/tmp/engine_supervisor.sock"
 #define LOG_BUFFER_SIZE 65536
 #define LOG_ENTRY_SIZE  512
 #define CHILD_STACK_SIZE 65536
@@ -53,6 +64,8 @@ typedef struct {
     int hard_limit_killed;
 } container_t;
 
+/* Hash table: slots indexed by djb2(id) % MAX_CONTAINERS with linear probing.
+ * An empty slot has id[0] == '\0'.  count tracks occupied slots. */
 typedef struct {
     container_t containers[MAX_CONTAINERS];
     int count;
@@ -82,7 +95,6 @@ typedef struct {
     char container_id[MAX_ID_LEN];
 } pipe_reader_t;
 
-/* Args passed to container_main via clone() */
 typedef struct {
     char rootfs[MAX_PATH_LEN];
     char cmd[MAX_CMD_LEN];
@@ -95,6 +107,34 @@ static bounded_buffer_t     log_buffer;
 static int                  supervisor_socket = -1;
 static volatile sig_atomic_t should_shutdown  = 0;
 static volatile sig_atomic_t child_exited     = 0;
+
+/* ── djb2 hash + open-addressing lookup ────────────────────────────────────
+ *
+ * djb2: h = h * 33 XOR c   (Bernstein, 1991)
+ * Chosen because it spreads short ASCII strings well with minimal code.
+ * Linear probing resolves collisions; the table is never more than 64 slots.
+ */
+static uint32_t djb2_hash(const char *s) {
+    uint32_t h = 5381;
+    unsigned char c;
+    while ((c = (unsigned char)*s++))
+        h = ((h << 5) + h) ^ c;
+    return h;
+}
+
+/* Return the index of the slot that either already holds id, or the first
+ * empty slot where id can be inserted.  Returns -1 only if the table is
+ * completely full and id is not present. */
+static int container_slot(const char *id) {
+    uint32_t start = djb2_hash(id) % MAX_CONTAINERS;
+    for (uint32_t i = 0; i < MAX_CONTAINERS; i++) {
+        uint32_t idx = (start + i) % MAX_CONTAINERS;
+        if (metadata.containers[idx].id[0] == '\0' ||
+            strcmp(metadata.containers[idx].id, id) == 0)
+            return (int)idx;
+    }
+    return -1;
+}
 
 /* ── bounded buffer ─────────────────────────────────────────────────────── */
 
@@ -190,7 +230,6 @@ static void *logging_consumer(void *arg) {
 
 /* ── arg parsing ────────────────────────────────────────────────────────── */
 
-/* Split cmd into tokens, storing strdup'd pointers in argv_out. Caller frees. */
 static int parse_args(const char *cmd, char **argv_out, int max_args) {
     char *copy  = strdup(cmd);
     char *token;
@@ -208,28 +247,22 @@ static int parse_args(const char *cmd, char **argv_out, int max_args) {
 
 /* ── container entry point ──────────────────────────────────────────────── */
 
-/* Runs in the child process created by clone(). */
 static int container_main(void *arg) {
     container_args_t *a = (container_args_t *)arg;
 
-    /* Redirect stdout + stderr to logging pipe */
     dup2(a->pipe_write_fd, STDOUT_FILENO);
     dup2(a->pipe_write_fd, STDERR_FILENO);
     close(a->pipe_write_fd);
 
-    /* Apply scheduling priority */
     if (a->nice_val != 0)
         setpriority(PRIO_PROCESS, 0, a->nice_val);
 
-    /* chroot into the container's rootfs */
     if (chroot(a->rootfs) < 0) { perror("chroot"); return 1; }
     if (chdir("/")        < 0) { perror("chdir");  return 1; }
 
-    /* Mount /proc *after* chroot so it lands inside the container */
     if (mount("proc", "/proc", "proc", 0, NULL) < 0)
-        perror("mount /proc");   /* non-fatal */
+        perror("mount /proc");
 
-    /* Parse and exec the command */
     char *argv[64];
     char  buf[MAX_CMD_LEN];
     strncpy(buf, a->cmd, MAX_CMD_LEN - 1);
@@ -272,14 +305,12 @@ static void unregister_from_monitor(pid_t pid) {
 
 /* ── container lifecycle ────────────────────────────────────────────────── */
 
-/* Returns child host PID on success, -1 on error. */
 static pid_t start_container(const char *id, const char *rootfs, const char *cmd,
                               unsigned long soft_mib, unsigned long hard_mib,
                               int nice_val) {
     int pipefd[2];
     if (pipe(pipefd) < 0) { perror("pipe"); return -1; }
 
-    /* pipefd[0] is read-only in the parent; close it in the exec'd child */
     fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
 
     char *stack = malloc(CHILD_STACK_SIZE);
@@ -305,19 +336,19 @@ static pid_t start_container(const char *id, const char *rootfs, const char *cmd
         return -1;
     }
 
-    /* Parent closes write end; child has its own via dup2 */
     close(pipefd[1]);
-    /* stack/args intentionally not freed: child uses them until execvp replaces image */
 
-    /* Record metadata */
+    /* Store metadata in the hash-table slot for this id */
     pthread_mutex_lock(&metadata.lock);
-    if (metadata.count >= MAX_CONTAINERS) {
+    int slot = container_slot(id);
+    if (slot < 0 || metadata.count >= MAX_CONTAINERS) {
         pthread_mutex_unlock(&metadata.lock);
         kill(child, SIGKILL);
         close(pipefd[0]);
         return -1;
     }
-    container_t *c = &metadata.containers[metadata.count++];
+    container_t *c = &metadata.containers[slot];
+    int is_new = (c->id[0] == '\0');
     memset(c, 0, sizeof(*c));
     strncpy(c->id, id, MAX_ID_LEN - 1);
     c->host_pid       = child;
@@ -327,12 +358,11 @@ static pid_t start_container(const char *id, const char *rootfs, const char *cmd
     c->nice_value     = nice_val;
     c->start_time     = time(NULL);
     snprintf(c->log_path, sizeof(c->log_path), "/tmp/container-%s.log", id);
+    if (is_new) metadata.count++;
     pthread_mutex_unlock(&metadata.lock);
 
-    /* Register with kernel memory monitor (best-effort) */
     register_with_monitor(child, soft_mib, hard_mib);
 
-    /* Logging producer thread reads from pipe and feeds bounded buffer */
     pipe_reader_t *reader = malloc(sizeof(pipe_reader_t));
     if (reader) {
         reader->pipe_fd = pipefd[0];
@@ -347,16 +377,16 @@ static pid_t start_container(const char *id, const char *rootfs, const char *cmd
     return child;
 }
 
-/* Called from main thread only (not signal handler). */
+/* Scan all slots by host PID (PID is not hashed, so linear scan is correct). */
 static void reap_children(void) {
-    int    status;
-    pid_t  pid;
+    int   status;
+    pid_t pid;
 
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         pthread_mutex_lock(&metadata.lock);
-        for (int i = 0; i < metadata.count; i++) {
+        for (int i = 0; i < MAX_CONTAINERS; i++) {
             container_t *c = &metadata.containers[i];
-            if (c->host_pid != pid) continue;
+            if (c->id[0] == '\0' || c->host_pid != pid) continue;
 
             if (WIFEXITED(status)) {
                 c->exit_status = WEXITSTATUS(status);
@@ -378,24 +408,23 @@ static void reap_children(void) {
     }
 }
 
+/* Hash-based O(1) lookup by id. */
 static void stop_container(const char *id) {
     pthread_mutex_lock(&metadata.lock);
-    for (int i = 0; i < metadata.count; i++) {
-        container_t *c = &metadata.containers[i];
-        if (strcmp(c->id, id) != 0) continue;
+    int slot = container_slot(id);
+    if (slot >= 0 && metadata.containers[slot].id[0] != '\0') {
+        container_t *c = &metadata.containers[slot];
         c->stop_requested = 1;
         if (c->state == STATE_RUNNING) {
             kill(c->host_pid, SIGTERM);
             c->state = STATE_STOPPED;
         }
-        break;
     }
     pthread_mutex_unlock(&metadata.lock);
 }
 
 /* ── signal handler ─────────────────────────────────────────────────────── */
 
-/* Keep signal handler minimal: no mutex, no memory allocation. */
 static void signal_handler(int sig) {
     if (sig == SIGCHLD)
         child_exited = 1;
@@ -418,11 +447,10 @@ static void handle_command(const char *cmd_line, char *resp, int resp_size) {
         goto cleanup;
     }
 
-    /* ── supervisor ── */
     if (strcmp(argv[0], "supervisor") == 0) {
-        snprintf(resp, resp_size, "Supervisor running\n");
+        snprintf(resp, resp_size, "Supervisor running [%s | %s]\n",
+                 AUTHOR_NAME, AUTHOR_SRN);
 
-    /* ── start / run ── */
     } else if (strcmp(argv[0], "start") == 0 || strcmp(argv[0], "run") == 0) {
         int is_run = (strcmp(argv[0], "run") == 0);
 
@@ -440,7 +468,6 @@ static void handle_command(const char *cmd_line, char *resp, int resp_size) {
         strncpy(rootfs,  argv[2], MAX_PATH_LEN - 1);
         strncpy(run_cmd, argv[3], MAX_CMD_LEN  - 1);
 
-        /* Parse optional flags; non-flag tokens are additional command args */
         for (int i = 4; i < nargs; i++) {
             if (strcmp(argv[i], "--soft-mib") == 0 && i + 1 < nargs) {
                 soft_mib = strtoul(argv[++i], NULL, 10);
@@ -449,13 +476,12 @@ static void handle_command(const char *cmd_line, char *resp, int resp_size) {
             } else if (strcmp(argv[i], "--nice") == 0 && i + 1 < nargs) {
                 nice_val = atoi(argv[++i]);
             } else {
-                strncat(run_cmd, " ",      MAX_CMD_LEN - strlen(run_cmd) - 1);
-                strncat(run_cmd, argv[i],  MAX_CMD_LEN - strlen(run_cmd) - 1);
+                strncat(run_cmd, " ",     MAX_CMD_LEN - strlen(run_cmd) - 1);
+                strncat(run_cmd, argv[i], MAX_CMD_LEN - strlen(run_cmd) - 1);
             }
         }
 
         if (is_run) {
-            /* Block SIGCHLD so we can waitpid without racing the signal handler */
             sigset_t blk, old;
             sigemptyset(&blk);
             sigaddset(&blk, SIGCHLD);
@@ -470,14 +496,13 @@ static void handle_command(const char *cmd_line, char *resp, int resp_size) {
                 goto cleanup;
             }
 
-            /* Block until this container exits */
             int stat = 0;
             waitpid(run_pid, &stat, 0);
 
             pthread_mutex_lock(&metadata.lock);
-            for (int i = 0; i < metadata.count; i++) {
+            for (int i = 0; i < MAX_CONTAINERS; i++) {
                 container_t *c = &metadata.containers[i];
-                if (c->host_pid != run_pid) continue;
+                if (c->id[0] == '\0' || c->host_pid != run_pid) continue;
                 if (WIFEXITED(stat)) {
                     c->exit_status = WEXITSTATUS(stat);
                     c->state       = STATE_STOPPED;
@@ -508,15 +533,16 @@ static void handle_command(const char *cmd_line, char *resp, int resp_size) {
                          "Container %s started (pid %d)\n", id, (int)pid);
         }
 
-    /* ── ps ── */
     } else if (strcmp(argv[0], "ps") == 0) {
         pos += snprintf(resp + pos, resp_size - pos,
                         "%-12s  %-7s  %-10s  %-10s  %-10s\n",
                         "ID", "PID", "State", "Soft(MiB)", "Hard(MiB)");
         pthread_mutex_lock(&metadata.lock);
-        for (int i = 0; i < metadata.count && pos < resp_size - 128; i++) {
+        /* Iterate all hash-table slots; skip empty ones */
+        for (int i = 0; i < MAX_CONTAINERS && pos < resp_size - 128; i++) {
             container_t *c = &metadata.containers[i];
-            const char  *st;
+            if (c->id[0] == '\0') continue;
+            const char *st;
             switch (c->state) {
                 case STATE_STARTING: st = "starting"; break;
                 case STATE_RUNNING:  st = "running";  break;
@@ -531,7 +557,6 @@ static void handle_command(const char *cmd_line, char *resp, int resp_size) {
         }
         pthread_mutex_unlock(&metadata.lock);
 
-    /* ── logs ── */
     } else if (strcmp(argv[0], "logs") == 0) {
         if (nargs < 2) {
             snprintf(resp, resp_size, "ERROR: logs <id>\n");
@@ -541,8 +566,7 @@ static void handle_command(const char *cmd_line, char *resp, int resp_size) {
         snprintf(path, sizeof(path), "/tmp/container-%s.log", argv[1]);
         FILE *f = fopen(path, "r");
         if (!f) {
-            snprintf(resp, resp_size,
-                     "No logs for container %s\n", argv[1]);
+            snprintf(resp, resp_size, "No logs for container %s\n", argv[1]);
             goto cleanup;
         }
         char buf[512];
@@ -552,7 +576,6 @@ static void handle_command(const char *cmd_line, char *resp, int resp_size) {
         if (pos == 0)
             snprintf(resp, resp_size, "(log is empty)\n");
 
-    /* ── stop ── */
     } else if (strcmp(argv[0], "stop") == 0) {
         if (nargs < 2) {
             snprintf(resp, resp_size, "ERROR: stop <id>\n");
@@ -576,13 +599,11 @@ static void accept_cli_connections(void) {
     char cmd_buf[MAX_CMD_LEN];
 
     while (!should_shutdown) {
-        /* Reap any zombies from the main thread (safe to lock here) */
         if (child_exited) {
             child_exited = 0;
             reap_children();
         }
 
-        /* Use select with 1-second timeout so we can check flags */
         fd_set rfds;
         struct timeval tv = {1, 0};
         FD_ZERO(&rfds);
@@ -629,7 +650,6 @@ static int run_supervisor(const char *rootfs_base) {
 
     pthread_create(&consumer_thread, NULL, logging_consumer, NULL);
 
-    /* Use sigaction so SA_RESTART keeps accept() alive on SIGCHLD */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
@@ -640,7 +660,8 @@ static int run_supervisor(const char *rootfs_base) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
 
-    printf("Supervisor started, listening on %s\n", SOCKET_PATH);
+    printf("Supervisor started [%s | %s]\n", AUTHOR_NAME, AUTHOR_SRN);
+    printf("Listening on %s\n", SOCKET_PATH);
     printf("Base rootfs: %s\n", rootfs_base);
     fflush(stdout);
 
@@ -649,15 +670,14 @@ static int run_supervisor(const char *rootfs_base) {
     printf("Supervisor shutting down...\n");
     fflush(stdout);
 
-    /* Ask running containers to exit */
     pthread_mutex_lock(&metadata.lock);
-    for (int i = 0; i < metadata.count; i++) {
-        if (metadata.containers[i].state == STATE_RUNNING)
+    for (int i = 0; i < MAX_CONTAINERS; i++) {
+        if (metadata.containers[i].id[0] != '\0' &&
+            metadata.containers[i].state == STATE_RUNNING)
             kill(metadata.containers[i].host_pid, SIGTERM);
     }
     pthread_mutex_unlock(&metadata.lock);
 
-    /* Drain logging pipeline */
     pthread_mutex_lock(&log_buffer.lock);
     log_buffer.shutdown = 1;
     pthread_cond_broadcast(&log_buffer.not_empty);
@@ -674,7 +694,7 @@ static int run_supervisor(const char *rootfs_base) {
 
 static int run_cli(int argc, char **argv) {
     struct sockaddr_un addr;
-    char cmd_buf[MAX_CMD_LEN]  = {0};
+    char cmd_buf[MAX_CMD_LEN]    = {0};
     char resp_buf[RESPONSE_SIZE] = {0};
 
     for (int i = 1; i < argc; i++) {
@@ -708,6 +728,8 @@ static int run_cli(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
+        fprintf(stderr, "Multi-Container Runtime  [%s | %s]\n",
+                AUTHOR_NAME, AUTHOR_SRN);
         fprintf(stderr, "Usage:\n");
         fprintf(stderr, "  %s supervisor <base-rootfs>\n", argv[0]);
         fprintf(stderr, "  %s start <id> <rootfs> <cmd> [--soft-mib N] [--hard-mib N] [--nice N]\n", argv[0]);

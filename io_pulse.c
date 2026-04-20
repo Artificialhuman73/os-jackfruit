@@ -1,53 +1,57 @@
+/* CHIRANTH.R (PES1UG24AM354) | Deeptanshu Kumar (PES1UG24AM357)
+ * I/O-bound workload: write Fibonacci sequences to temp files,
+ * read them back computing a running XOR checksum, then delete. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
-#include <string.h>
 
-/* I/O-bound workload: perform frequent I/O operations */
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
     long duration_sec = 5;
-    if (argc > 1) {
-        duration_sec = atol(argv[1]);
-    }
+    if (argc > 1) duration_sec = atol(argv[1]);
+
+    printf("[io_pulse] CHIRANTH.R (PES1UG24AM354) | Deeptanshu Kumar (PES1UG24AM357)\n");
+    printf("[io_pulse] Fibonacci I/O workload for %ld s\n", duration_sec);
+    fflush(stdout);
 
     time_t start = time(NULL);
     int iteration = 0;
     char filename[64];
-    FILE* f;
-
-    printf("[io_pulse] Starting I/O-bound workload for %ld seconds\n", duration_sec);
 
     while (time(NULL) - start < duration_sec) {
-        /* Write to a temporary file */
-        snprintf(filename, sizeof(filename), "/tmp/io_pulse_%d.tmp", iteration);
-        f = fopen(filename, "w");
+        /* Reuse a small pool of 8 temp files to avoid filling /tmp */
+        snprintf(filename, sizeof(filename),
+                 "/tmp/io_pulse_%d.tmp", iteration % 8);
+
+        /* Write: Fibonacci sequence up to term 200 */
+        FILE *f = fopen(filename, "w");
         if (f) {
-            for (int i = 0; i < 100; i++) {
-                fprintf(f, "Line %d: This is test data for I/O bound workload\n", i);
+            unsigned long a = 0, b = 1;
+            for (int i = 0; i < 200; i++) {
+                fprintf(f, "fib[%03d] = %lu\n", i, a);
+                unsigned long c = a + b;
+                a = b;
+                b = c;
             }
             fclose(f);
         }
 
-        /* Read it back */
+        /* Read back: accumulate XOR checksum over every byte */
         f = fopen(filename, "r");
         if (f) {
-            char buf[256];
-            while (fgets(buf, sizeof(buf), f)) {
-                /* Just read */
-            }
+            unsigned char checksum = 0;
+            int ch;
+            while ((ch = fgetc(f)) != EOF)
+                checksum ^= (unsigned char)ch;
             fclose(f);
+            (void)checksum;
         }
 
-        /* Delete file */
         unlink(filename);
-
         iteration++;
-
-        /* Small sleep to simulate realistic I/O pattern */
         usleep(10000);
     }
 
-    printf("[io_pulse] Completed %d iterations\n", iteration);
+    printf("[io_pulse] Done — %d iterations\n", iteration);
     return 0;
 }

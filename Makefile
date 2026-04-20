@@ -1,6 +1,9 @@
 KERNEL_SRC := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
+# Kernel module object
+obj-m := monitor.o
+
 # Compiler flags
 CFLAGS := -Wall -Wextra -O2 -g
 LDFLAGS := -pthread
